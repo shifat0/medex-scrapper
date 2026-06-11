@@ -59,14 +59,11 @@ def get_all_company_links():
         page_links = []
 
         for tag in company_tags:
+            print(f"  Found tag: {tag}")
             href = tag["href"]
-            parts = href.strip("/").split("/")
-            # Valid company link has exactly 3 parts: companies / id / slug
-            if len(parts) == 3 and parts[0] == "companies" and parts[1].isdigit():
-                full_url = BASE_URL + "/" + href.strip("/")
-                if full_url not in page_links:
-                    page_links.append(full_url)
+            page_links.append(href)
 
+        print(f"  Extracted {len(page_links)} company links from page {page}")
         if not page_links:
             print(f"  No companies found on page {page}, stopping.")
             break
