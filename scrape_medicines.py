@@ -1,215 +1,168 @@
 # ─── scrape_medicines.py ──────────────────────────────────
-# Phase 1: Load companies_detail.csv → for each company URL,
-#          paginate /brands pages → collect all brand list rows
-#          (name, dosage form, strength, generic, price, url)
-# Phase 2: Visit each brand detail URL → scrape full details
+# Scrapes brand detail pages directly.
+# Flow:
+#   1. Load companies_detail.csv
+#   2. For each company, paginate /brands → collect brand detail URLs
+#   3. Visit each brand URL → parse full detail page
+#   4. Save to brands_detail.csv (with periodic progress saves)
+#
+# Anti-bot measures:
+#   - Random delays with longer rest bursts every N requests
+#   - Rotating User-Agent via fake_useragent
+#   - Random realistic header ordering
+#   - cloudscraper for Cloudflare bypass
 #
 # Run:  python scrape_medicines.py
 # ──────────────────────────────────────────────────────────
 
 import random
-import re
 import time
+from pathlib import Path
 
+import cloudscraper
 import pandas as pd
 from lxml import html as lhtml
 
-from config import MIN_DELAY, MAX_DELAY, SAVE_EVERY
-from utils import safe_get
+from config import SAVE_EVERY
 
 # ── Files ─────────────────────────────────────────────────
-COMPANY_FILE = "../companies_detail.csv"   # input  (needs: url, name columns)
-BRAND_LIST   = "../brands_list.csv"        # Phase 1 output
-BRAND_DETAIL = "../brands_detail.csv"      # Phase 2 output
+COMPANY_FILE  = "../companies_detail.csv"
+BRAND_DETAIL  = "../brands_details_2.csv"
+PROGRESS_FILE = "../brands_progress.txt"   # stores last scraped URL to resume
+
+# ── Delays (seconds) ──────────────────────────────────────
+MIN_DELAY     = 2.0
+MAX_DELAY     = 5.0
+BURST_EVERY   = 30      # take a longer break every N requests
+BURST_MIN     = 15.0
+BURST_MAX     = 35.0
 
 # ── XPath constants ───────────────────────────────────────
-# The three col-divs that hold data-rows sit inside div[2] of the grid
-BRAND_COLS_ROOT   = '//*[@id="ms-block"]/section/div/div[2]'
-# Every hoverable-block anchor IS one brand card
-BRAND_CARD_XPATH  = './/a[contains(@class,"hoverable-block")]'
-# Within each card:
-NAME_XPATH        = './/div[contains(@class,"data-row-top")]'
-STRENGTH_XPATH    = './/div[contains(@class,"data-row-strength")]//span[contains(@class,"grey")]'
-GENERIC_XPATH     = './/div[not(contains(@class,"data-row-top")) and not(contains(@class,"data-row-strength")) and not(contains(@class,"packages-wrapper"))]'
-PRICE_XPATH       = './/span[contains(@class,"package-pricing")]'
-PACKAGE_XPATH     = './/span[contains(@class,"unit-price")]'
-# Pagination — next link
-NEXT_PAGE_XPATH   = '//a[@rel="next"]'
-
-
-def polite_delay():
-    time.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
+BRAND_COLS_ROOT  = '//*[@id="ms-block"]/section/div/div[2]'
+BRAND_CARD_XPATH = './/a[contains(@class,"hoverable-block")]'
+NEXT_PAGE_XPATH  = '//a[@rel="next"]'
 
 
 # ─────────────────────────────────────────────────────────
-# Helpers
+# HTTP — cloudscraper handles Cloudflare JS challenges
 # ─────────────────────────────────────────────────────────
 
-def brands_url(company_url: str, page: int) -> str:
+scraper = cloudscraper.create_scraper(
+    browser={"browser": "chrome", "platform": "windows", "mobile": False}
+)
+
+_request_count = 0
+
+
+def fetch(url: str) -> bytes:
     """
-    Build the brands listing URL for a company.
-    company_url examples:
-      https://medex.com.bd/companies/2/aci-limited
-      https://medex.com.bd/companies/103/ad-din-pharmaceuticals-ltd/brands
-    Always normalise to: <base>/brands?page=N
+    GET url, rotate headers, enforce delays, burst-rest every N requests.
+    Returns response bytes.
     """
+    global _request_count
+
+    _request_count += 1
+
+    # Burst rest
+    if _request_count % BURST_EVERY == 0:
+        rest = random.uniform(BURST_MIN, BURST_MAX)
+        print(f"  [Burst rest: {rest:.1f}s after {_request_count} requests]")
+        time.sleep(rest)
+    else:
+        time.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
+
+    res = scraper.get(url, timeout=20)
+    res.raise_for_status()
+    return res.content
+
+
+def is_blocked(tree) -> bool:
+    """Detect Cloudflare / security-check page."""
+    title = tree.xpath("//title/text()")
+    body  = tree.xpath("//body//text()")
+    signals = ["security check", "unusual traffic", "cloudflare", "just a moment"]
+    combined = " ".join(title + body).lower()
+    return any(s in combined for s in signals)
+
+
+# ─────────────────────────────────────────────────────────
+# Brand URL collection  (listing pages only — no detail fetch)
+# ─────────────────────────────────────────────────────────
+
+def brands_list_url(company_url: str, page: int) -> str:
     base = company_url.rstrip("/")
     if not base.endswith("/brands"):
         base += "/brands"
     return f"{base}?page={page}"
 
 
-def parse_price(card) -> tuple[str, str]:
-    """
-    Return (package_label, price_value) from the package-pricing span.
-    e.g. '100 ml bottle', '৳ 280.00'  or  'Unit Price', '৳ 21.14'
-    """
-    unit_span = card.xpath(PACKAGE_XPATH)
-    price_span = card.xpath(PRICE_XPATH)
-
-    price = price_span[0].text_content().strip() if price_span else "N/A"
-
-    if unit_span:
-        # full text of unit-price span, minus the nested pricing text
-        full = unit_span[0].text_content().strip()
-        # label is everything before the price value
-        label = full.replace(price, "").strip().strip(":")
-        label = label if label else "Unit Price"
-    else:
-        label = "Unit Price"
-
-    return label, price
-
-
-# ─────────────────────────────────────────────────────────
-# PHASE 1 — Collect brand list rows for every company
-# ─────────────────────────────────────────────────────────
-
-def scrape_brand_cards(tree) -> list[dict]:
-    """Parse all hoverable-block cards from an already-fetched tree."""
-    roots = tree.xpath(BRAND_COLS_ROOT)
-    if not roots:
-        return []
-
-    cards = []
-    for card in roots[0].xpath(BRAND_CARD_XPATH):
-        brand_url = card.get("href", "").strip()
-
-        # Name + dosage form live together in data-row-top
-        name_div = card.xpath(NAME_XPATH)
-        if name_div:
-            # dosage form is in a <span class="inline-dosage-form">
-            dosage_span = name_div[0].xpath('.//span[contains(@class,"inline-dosage-form")]')
-            dosage_form = dosage_span[0].text_content().strip() if dosage_span else ""
-            # brand name = full text minus the dosage form text
-            full_name = name_div[0].text_content().strip()
-            brand_name = full_name.replace(dosage_form, "").strip()
-        else:
-            brand_name = dosage_form = "N/A"
-
-        # Strength
-        strength_el = card.xpath(STRENGTH_XPATH)
-        strength = strength_el[0].text_content().strip() if strength_el else "N/A"
-
-        # Generic name — the plain div that isn't top/strength/packages
-        generic_divs = card.xpath(GENERIC_XPATH)
-        # Filter to direct children of the data-row div, skip empties
-        generic = "N/A"
-        for el in generic_divs:
-            text = el.text_content().strip()
-            if text and len(text) > 1:
-                generic = text
-                break
-
-        # Price
-        pkg_label, price = parse_price(card)
-
-        cards.append({
-            "brand_name":    brand_name,
-            "dosage_form":   dosage_form,
-            "strength":      strength,
-            "generic":       generic,
-            "package_label": pkg_label,
-            "price":         price,
-            "url":           brand_url,
-        })
-
-    return cards
-
-
-def collect_brands_for_company(company_name: str, company_url: str) -> list[dict]:
-    """Paginate all /brands pages for one company and return every card."""
-    all_cards: list[dict] = []
+def collect_brand_urls_for_company(company_url: str) -> list[str]:
+    """Return all brand detail URLs from a company's paginated /brands pages."""
+    urls: list[str] = []
     page = 1
 
     while True:
-        url  = brands_url(company_url, page)
-        print(f"    [Page {page}] {url}")
+        url = brands_list_url(company_url, page)
+        print(f"    [Listing page {page}] {url}")
 
         try:
-            tree  = lhtml.fromstring(safe_get(url).content)
-            cards = scrape_brand_cards(tree)
+            tree  = lhtml.fromstring(fetch(url))
         except Exception as exc:
-            print(f"    ✗ Failed: {exc}")
+            print(f"    ✗ Fetch failed: {exc}")
             break
 
-        if not cards:
-            print("    No cards found — stopping.")
+        if is_blocked(tree):
+            print("    ✗ Blocked — stopping listing collection for this company.")
             break
 
-        # Tag each card with its source company
-        for c in cards:
-            c["company_name"] = company_name
-            c["company_url"]  = company_url
+        roots = tree.xpath(BRAND_COLS_ROOT)
+        if not roots:
+            print("    No grid root found — stopping.")
+            break
 
-        all_cards.extend(cards)
-        print(f"    ✓ {len(cards)} brands | Running total: {len(all_cards)}")
+        page_urls = [
+            card.get("href", "").strip()
+            for card in roots[0].xpath(BRAND_CARD_XPATH)
+            if card.get("href", "").strip()
+        ]
 
-        # Follow next page if present
+        if not page_urls:
+            print("    No brand cards found — stopping.")
+            break
+
+        urls.extend(page_urls)
+        print(f"    ✓ {len(page_urls)} brands | Total: {len(urls)}")
+
         if tree.xpath(NEXT_PAGE_XPATH):
             page += 1
-            polite_delay()
         else:
             break
 
-    return all_cards
-
-
-def collect_all_brands(company_df: pd.DataFrame) -> list[dict]:
-    """Iterate every company row and collect all brand list entries."""
-    all_brands: list[dict] = []
-    total = len(company_df)
-
-    for i, row in enumerate(company_df.itertuples(), 1):
-        print(f"\n[{i}/{total}] {row.name}")
-        brands = collect_brands_for_company(row.name, row.url)
-        all_brands.extend(brands)
-
-        # Periodic save
-        if i % SAVE_EVERY == 0:
-            pd.DataFrame(all_brands).to_csv(BRAND_LIST, index=False, encoding="utf-8-sig")
-            print(f"  [Progress saved: {i}/{total} companies]")
-
-        polite_delay()
-
-    pd.DataFrame(all_brands).to_csv(BRAND_LIST, index=False, encoding="utf-8-sig")
-    return all_brands
+    return urls
 
 
 # ─────────────────────────────────────────────────────────
-# PHASE 2 — Fetch full brand detail pages
+# Brand detail page parser
 # ─────────────────────────────────────────────────────────
 
-def parse_brand_detail(url: str) -> dict:
-    """Extract full details from a single brand detail page."""
-    tree = lhtml.fromstring(safe_get(url).content)
+def parse_brand_detail(url: str) -> dict | None:
+    """
+    Fetch and parse a single brand detail page.
+    Returns None if blocked.
+    """
+    tree = lhtml.fromstring(fetch(url))
+
+    if is_blocked(tree):
+        print("  ✗ Blocked on detail page.")
+        return None
+
     data: dict = {"url": url}
 
-    # Brand name (h1)
+    # Brand name
     h1 = tree.xpath("//h1/text()")
     data["name"] = h1[0].strip() if h1 else "N/A"
 
-    # Key-value detail table (Generic, Strength, Dosage Form, Pack Size, Price…)
+    # Key-value detail table
     for row in tree.xpath("//table//tr"):
         cols = row.xpath(".//td")
         if len(cols) == 2:
@@ -234,39 +187,20 @@ def parse_brand_detail(url: str) -> dict:
     return data
 
 
-def enrich_brands(brand_df: pd.DataFrame) -> list[dict]:
-    """Visit every brand URL and merge list-level fields into detail dict."""
-    all_data: list[dict] = []
-    total = len(brand_df)
+# ─────────────────────────────────────────────────────────
+# Progress helpers  (resume after interruption)
+# ─────────────────────────────────────────────────────────
 
-    for i, row in enumerate(brand_df.itertuples(), 1):
-        url = row.url
-        print(f"[{i}/{total}] {url}")
+def load_progress() -> set[str]:
+    """Return set of already-scraped URLs from progress file."""
+    if Path(PROGRESS_FILE).exists():
+        return set(Path(PROGRESS_FILE).read_text().splitlines())
+    return set()
 
-        try:
-            detail = parse_brand_detail(url)
-            # Carry over list-level data as fallbacks
-            detail.setdefault("brand_name",    row.brand_name)
-            detail.setdefault("dosage_form",   row.dosage_form)
-            detail.setdefault("strength",      row.strength)
-            detail.setdefault("generic",       row.generic)
-            detail.setdefault("price",         row.price)
-            detail.setdefault("company_name",  row.company_name)
-            detail.setdefault("company_url",   row.company_url)
-            all_data.append(detail)
-            print(f"  ✓ {detail.get('name', 'Unknown')}")
-        except Exception as exc:
-            print(f"  ✗ Failed: {exc}")
-            all_data.append({**row._asdict(), "error": str(exc)})
 
-        if i % SAVE_EVERY == 0:
-            pd.DataFrame(all_data).to_csv(BRAND_DETAIL, index=False, encoding="utf-8-sig")
-            print(f"  [Saved progress: {i}/{total}]")
-
-        polite_delay()
-
-    pd.DataFrame(all_data).to_csv(BRAND_DETAIL, index=False, encoding="utf-8-sig")
-    return all_data
+def save_url_progress(url: str):
+    with open(PROGRESS_FILE, "a") as f:
+        f.write(url + "\n")
 
 
 # ─────────────────────────────────────────────────────────
@@ -275,24 +209,65 @@ def enrich_brands(brand_df: pd.DataFrame) -> list[dict]:
 
 if __name__ == "__main__":
     print("=" * 55)
-    print("  MedEx — Medicine / Brand Scraper")
+    print("  MedEx — Brand Detail Scraper")
     print("=" * 55)
 
-    # ── Phase 1 ───────────────────────────────────────────
-    print(f"\n[Phase 1] Loading companies from: {COMPANY_FILE}\n")
-    company_df = pd.read_csv(COMPANY_FILE, usecols=["name", "url"])
-    company_df = company_df.dropna(subset=["url"])
-    print(f"  {len(company_df)} companies loaded.")
+    # Load companies
+    print(f"\nLoading companies from: {COMPANY_FILE}")
+    company_df = pd.read_csv(COMPANY_FILE, usecols=["name", "url"]).dropna(subset=["url"])
+    print(f"  {len(company_df)} companies loaded.\n")
 
-    print("\nCollecting brand listing rows...\n")
-    brands = collect_all_brands(company_df)
-    print(f"\n✓ {len(brands)} brands saved to: {BRAND_LIST}")
+    # Resume support
+    done_urls   = load_progress()
+    all_data: list[dict] = []
 
-    # ── Phase 2 ───────────────────────────────────────────
-    print(f"\n[Phase 2] Fetching full brand details...\n")
-    brand_df = pd.read_csv(BRAND_LIST)
-    enrich_brands(brand_df)
+    # Load existing output to append rather than overwrite
+    if Path(BRAND_DETAIL).exists() and done_urls:
+        all_data = pd.read_csv(BRAND_DETAIL).to_dict("records")
+        print(f"  Resuming — {len(done_urls)} URLs already scraped.\n")
+
+    total_companies = len(company_df)
+
+    for ci, crow in enumerate(company_df.itertuples(), 1):
+        print(f"\n{'='*40}")
+        print(f"[Company {ci}/{total_companies}] {crow.name}")
+        print(f"{'='*40}")
+
+        # Collect all brand URLs for this company
+        brand_urls = collect_brand_urls_for_company(crow.url)
+        # Filter already-done
+        brand_urls = [u for u in brand_urls if u not in done_urls]
+        print(f"  {len(brand_urls)} new brand URLs to scrape.\n")
+
+        for bi, burl in enumerate(brand_urls, 1):
+            print(f"  [{bi}/{len(brand_urls)}] {burl}")
+
+            result = parse_brand_detail(burl)
+
+            if result is None:
+                # Blocked — back off hard and retry once
+                print("  Backing off 60s then retrying once...")
+                time.sleep(random.uniform(55, 75))
+                result = parse_brand_detail(burl)
+
+            if result is None:
+                print("  Still blocked — skipping.")
+                continue
+
+            result["company_name"] = crow.name
+            result["company_url"]  = crow.url
+            all_data.append(result)
+            save_url_progress(burl)
+            print(f"  ✓ {result.get('name', 'Unknown')}")
+
+            # Periodic save
+            if len(all_data) % SAVE_EVERY == 0:
+                pd.DataFrame(all_data).to_csv(BRAND_DETAIL, index=False, encoding="utf-8-sig")
+                print(f"  [Progress saved: {len(all_data)} brands total]")
+
+    # Final save
+    pd.DataFrame(all_data).to_csv(BRAND_DETAIL, index=False, encoding="utf-8-sig")
 
     print("\n" + "=" * 55)
-    print(f"  Done! Full details saved to: {BRAND_DETAIL}")
+    print(f"  Done! {len(all_data)} brands saved to: {BRAND_DETAIL}")
     print("=" * 55)
