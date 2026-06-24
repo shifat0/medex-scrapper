@@ -35,11 +35,11 @@ COMPANY_DONE_FILE = "../companies_done.txt"   # companies fully finished —
 MIN_DELAY    = 4.0
 MAX_DELAY    = 9.0
 BURST_EVERY  = 15             # take a longer break every N requests
-BURST_MIN    = 30.0
-BURST_MAX    = 60.0
+BURST_MIN    = 300.0
+BURST_MAX    = 600.0
 
 # ── Block recovery ────────────────────────────────────────
-BLOCK_COOLDOWNS = [30, 60, 90]      # short escalating wait (s) per consecutive
+BLOCK_COOLDOWNS = [300, 600, 900]      # short escalating wait (s) per consecutive
                                      # block — soft rate-limits clear quickly;
                                      # if it's a hard IP block, longer waits
                                      # within this session won't help anyway
